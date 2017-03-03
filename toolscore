@@ -1,0 +1,877 @@
+(function() {
+	var root = this;
+	var previousUnderscore = root._;
+	var ArrayProto = Array.prototype,
+		ObjProto = Object.prototype,
+		FuncProto = Function.prototype;
+
+	var push = ArrayProto.push,
+		slice = ArrayProto.slice,
+		toString = ObjProto.toString,
+		hasOwnProperty = ObjProto.hasOwnProperty;
+	//将常用的ES5**的方法赋予变量
+	var
+		nativeIsArray = Array.isArray,
+		nativeKeys = Object.keys,
+		nativeBind = FuncProto.bind,
+		nativeCreate = Object.create;
+	//用于继承对象的空函数
+	var Ctor = function() {};
+
+	//主体对象
+	var _ = function(obj) {
+		if(obj instanceof _) {
+			return obj;
+		}
+		if(!(this instanceof _)) {
+			return new _(obj);
+		}
+		this._wrapped = obj;
+	};
+
+	if(typeof exports != 'undefined' && !exports.nodeType) {
+		if(typeof module != 'undefined' && !module.nodeType && module.exports) {
+			exports = module.exports = _;
+		}
+		exports._ = _;
+	} else {
+		root._ = _;
+	};
+	//CALLBACK的优化函数
+	var optimizeCb = function(func, context, argCount) {
+		if(context === void 0) {
+			return func;
+		}
+		switch(argCount) {
+			case 1:
+				return function(value) {
+					return func.call(context, value);
+				};
+				//case 2目前没用
+				/*case 2:
+					return function(value, other) {
+						return func.call(context, value, other);
+					};*/
+			case null:
+			case 3:
+				return function(value, index, collection) {
+					return func.call(context, value, index, collection);
+				};
+			case 4:
+				return function(accumulator, value, index, collection) {
+					return func.call(context, accumulator, value, index, collection);
+				};
+		};
+		return function() {
+			return func.apply(context, arguments);
+		};
+	};
+	var builtinIteratee;
+	//CALLBACK
+	var cb = function(value, context, argCount) {
+		if(_.iteratee !== builtinIteratee) return _.iteratee(value, context);
+		if(value == null) {
+			return _.identity;
+		}
+		if(_.isFunction(value)) {
+			return optimizeCb(value, context, argCount);
+		}
+		if(_.isObject(value)) {
+			return _.matcher(value);
+		}
+		return _.property(value);
+	};
+
+	//迭代功能函数，实质还是引用回调函数，添加了自定义功能
+	_.iteratee = builtinIteratee = function(value, context) {
+		return cb(value, context, Infinity);
+	};
+
+	//与ES6的rest param相似
+	//计算startIndex后的arguments对象，并传入数组
+	var restArgs = function(func, startIndex) {
+		startIndex = startIndex == null ? func.length - 1 : +startIndex;
+		return function() {
+			var length = Math.max(arguments.length - startIndex, 0),
+				rest = Array(length),
+				index = 0;
+			for(; index < length; index++) {
+				rest[index] = arguments[index + startIndex];
+			}
+			//感觉0、1、2更常用，优化下性能
+			switch(startIndex) {
+				case 0:
+					return func.call(this, rest);
+				case 1:
+					return func.call(this, arguments[0], rest);
+				case 2:
+					return func.call(this, arguments[0], arguments[1], rest);
+			}
+			var args = Array(startIndex + 1);
+			for(index = 0; index < startIndex; index++) {
+				args[index] = arguments[index];
+			}
+			args[startIndex] = rest;
+			return func.apply(this, args);
+		};
+	};
+
+	//创建继承自prototype的对象的函数
+	var baseCreate = function(prototype) {
+		if(!_.isObject(prototype)) return {};
+		if(nativeCreate) return nativeCreate(prototype);
+		Ctor.prototype = prototype;
+		var result = new Ctor;
+		Ctor.prototype = null;
+		return result;
+	};
+
+	//浅获取 返回obj中键值为key的项
+	var swallowProperty = function(key) {
+		return function(obj) {
+			return obj == null ? void 0 : obj[key];
+		}
+	};
+	
+	//深获取 
+	deepGet = function(obj, path) {
+		var length = path.length;
+		for(var i = 0; i < length; i++) {
+			if(obj == null) return void 0;
+			obj = obj[path[i]];
+		}
+		return length ? obj : void 0;
+	};
+	
+	//判断collection是不是数组
+	var MAX_ARRAY_INDEX = Math.pow(2, 53) - 1;
+	var getLength = swallowProperty('length');
+	var isArrayLike = function(collection) {
+		var length = getLength(collection);
+		return typeof length == 'number' && length >= 0 && length <= MAX_ARRAY_INDEX;
+	};
+	
+	//-------------------------------
+	//Collection Functions
+
+	//each对obj的每一项使用iteratee，但还返回原始obj，以方便链式调用，分为数组和非数组两种情况判断
+	_.each = _.forEach = function(obj, iteratee, context) {
+		iteratee = optimizeCb(iteratee, context);
+		var i, length;
+		if(isArrayLike(obj)) {
+			for(i = 0, length = obj.length; i < length; i++) {
+				iteratee(obj[i], i, obj);
+			}
+
+		} else {
+			var keys = _.keys(obj);
+			for(i = 0, length = keys.length; i < length; i++) {
+				iteratee(obj[keys[i]], keys[i], obj);
+			}
+		}
+		return obj;
+	};
+
+	//映射：对obj每一项使用iteratee，将返回值形成result数组，可以链式调用
+	_.map = _.collect = function(obj, iteratee, context) {
+		iteratee = cb(iteratee, context);
+		var keys = (!isArrayLike(obj)) && _.keys(obj),
+			length = (keys || obj).length,
+			result = Array(length);
+		for(var index = 0; index < length; index++) {
+			var currentKey = keys ? keys[index] : index;
+			result[index] = iteratee(obj[currentKey], currentKey, obj);
+		}
+		return result;
+	};
+
+	//规约核心函数：对obj每一项使用iteratee，将返回值形成一个对象，由多归一（memo是初始值，也是终值）
+	var createReduce = function(dir) {
+		var reducer = function(obj, iteratee, memo, initial) {
+			var keys = (!isArrayLike(obj)) && _.keys(obj),
+				length = (keys || obj).length;
+			index = (dir > 0) ? 0 : length - 1;
+			if(!initial) {
+				memo = obj[keys ? keys[index] : index];
+				index += dir;
+			}
+			for(; index >= 0 && index < length; index += dir) {
+				var currentKey = keys ? keys[index] : index;
+				memo = iteratee(memo, obj[currentKey], currentKey, obj);
+			}
+			return memo;
+		};
+
+		return function(obj, iteratee, memo, context) {
+			var initial = (arguments.length >= 3);
+			return reducer(obj, optimizeCb(iteratee, context, 4), memo, initial);
+		};
+	};
+	//从左规约
+	_.reduce = _.foldl = _.inject - createReduce(1);
+	//从右规约
+	_.reduceRight = _.foldr = createReduce(-1);
+
+	//遍历obj，返回obj中第一个符合predicate条件的项目，利用_.findIndex判断数组，利用_.findKey判断对象
+	_.find = _.detect = function(obj, predicate, context) {
+		var keyFinder = isArrayLike(obj) ? _.findIndex : _.findKey;
+		var key = keyFinder(obj, predicate, context);
+		if(key !== void 0 && key !== -1) return obj[key];
+	};
+	//遍历obj，返回obj中所有符合predicate条件的项目，将返回值存入results数组
+	_.filter = _.select = function(obj, predicate, context) {
+		var results = [];
+		predicate = cb(predicate, context);
+		_.each(obj, function(value, index, list) {
+			if(predicate(value, index, list)) results.push(value);
+		});
+		return results;
+	};
+
+	//与filter的筛选条件相反
+	_.reject = function(obj, predicate, context) {
+		return _.filter(obj, _.negate(cb(predicate)), context);
+	};
+
+	//遍历obj，如果每一项传入predicate都返回true，则返回true
+	//此处或可用negate
+	_.every = _.all = function(obj, predicate, context) {
+		predicate = cb(predicate, context);
+		var keys = !isArrayLike(obj) && _.keys(obj),
+			length = (keys || obj).length;
+		for(var index = 0; index < length; index++) {
+			var currentKey = keys ? keys[index] : index;
+			if(!predicate(obj[currentKey], currentKey, obj)) return false;
+		}
+		return true;
+	};
+	//遍历obj，只要有一项符合predicate，结果就返回true
+	_.some = _.any = function(obj, predicate, context) {
+		predicate = cb(predicate, context);
+		var keys = !isArrayLike(obj) && _.keys(obj),
+			length = (keys || obj).length;
+		for(var index = 0; index < length; index++) {
+			var currentKey = keys ? keys[index] : index;
+			if(predicate(obj[currentKey], currentKey, obj)) return true;
+		}
+		return false;
+	};
+	//判断obj是否含有item，obj可以是数组或对象,fromIndex默认为0
+	_.contains = _.includes = _.include = function(obj, item, fromIndex, guard) {
+		if(!_.isArray(obj)) {
+			obj = _.values(obj);
+		}
+		if(typeof fromIndex !== 'number' || guard) fromIndex = 0;
+		return _.indexOf(obj, item, fromIndex) >= 0;
+	};
+	
+	//
+	_.invoke=restArgs(function(obj,path,args){
+		var contextPath,func;
+		if(_.isFunction(path)){
+			func=path;
+		}else if(_.isArray(path)){
+			contextPath=path.slice(0,-1);
+			path=path[path.length-1];
+		}
+		return _.map(obj,function(context){
+			var method=func;
+			if(!method){
+				
+			}
+		});
+	});
+	//_.map映射的简化版本，将obj的key值返回为数组
+	_.pluck = function(obj, key) {
+		return _.map(obj, _.property(key));
+	};
+	//去obj的最大属性值，给定iteratee条件（条件可能是判断obj[i]某一项的最大值，可能是判断obj[i]长度最大值等等）的按条件判断
+	_.max = function(obj, iteratee, context) {
+		var result = -Infinity,
+			lastComputed = -Infinity,
+			value, computed;
+		if(iteratee == null || (typeof iteratee == 'number' && typeof obj[0] != 'object') && obj != null) {
+			obj = isArrayLike(obj) ? obj : _.values(obj);
+			var length = getLength(obj);
+			for(var i = 0; i < length; i++) {
+				value = obj[i];
+				//此处特意声明不等于null，null转换为数值后是>=0的，会产生错误
+				if(value != null && result < value) {
+					result = value;
+				}
+			}
+		} else {
+			iteratee = cb(iteratee, context);
+			//迭代写法
+			_.each(obj,function(v,index,list){
+				computed=iteratee(v,index,list);
+				if(computed>lastComputed||computed === -Infinity && result === -Infinity){
+					result=v;
+					lastComputed=computed;
+				}
+			});
+			//循环写法
+			/*for(var i=0,length=getLength(obj);i<length;i++){
+				value=obj[i];
+				var num=iteratee(value);
+				if(num!=null&&lastComputed<num){
+					lastComputed=num;
+					result=value;
+				}
+			}*/
+		}
+		return result;
+	};
+
+	//去obj的最小属性值，给定iteratee条件的按条件判断
+	_.min = function(obj, iteratee, context) {
+		var result = Infinity,
+			lastComputed = Infinity,
+			value, computed;
+		if(iteratee == null || (typeof iteratee == 'number' && typeof obj[0] != 'object') && obj != null) {
+			obj = isArrayLike(obj) ? obj : _.values(obj);
+			for(var i = 0, length = obj.length; i < length; i++) {
+				value = obj[i];
+				if(value != null && value < result) {
+					result = value;
+				}
+			}
+		} else {
+			iteratee = cb(iteratee, context);
+			_.each(obj, function(v, index, list) {
+				computed = iteratee(v, index, list);
+				if(computed < lastComputed || computed === Infinity && result === Infinity) {
+					result = v;
+					lastComputed = computed;
+				}
+			});
+		}
+		return result;
+	};
+	
+	//---------------------------------------------
+	// Array Functions
+
+	//获取数组array前n个元素
+	_.first = _.head = _.take = function(array, n, guard) {
+		if(array == null || array.length < 1) return void 0;
+		if(n == null || guard) return array[0];
+		return _.initial(array, array.length - n);
+	};
+
+	//返回除去array数组最后n项的数组
+	_.initial = function(array, n, guard) {
+		return slice.call(array, 0, Math.max(0, array.length - (n == null || guard ? 1 : n)));
+	};
+	//返回array数组的最后n个
+	_.last = function(array, n, guard) {
+		if(array == null || array.length < 0) return void 0;
+		if(n == null || guard) return array[array.length - 1];
+		return _.rest(array, Math.max(array.length - n));
+	};
+	//返回除去array数组前n项的数组
+	_.rest = _.tail = _.drop = function(array, n, guard) {
+		return slice.call(array, n = null || guard ? 1 : n);
+	};
+
+	//返回一个除去所有false值的 array副本。 false, null, 0, "", undefined 和 NaN 都是false值.
+	_.compact = function(array) {
+		return _.filter(array, function(num) {
+			if(!!num) {
+				return num;
+			}
+		});
+	};
+
+	//_.flatten的核心函数，平化数组
+	var flatten = function(input, shallow, strict, output) {
+		output = output || [];
+		var idx = output.length;
+		for(var i = 0, length = getLength(input); i < length; i++) {
+			var value = input[i];
+			if(isArrayLike(value) && (_.isArray(value) || _.isArguments(value))) {
+				if(shallow) {
+					var j = 0,
+						length = value.length;
+					for(; j < length; j++) {
+						output[idx++] = value[j];
+					}
+				} else {
+					flatten(input, shallow, strict, output);
+					idx = output.length;
+				}
+			} else if(!strict) {
+				output[idx++] = value;
+			}
+		}
+		return output;
+	};
+
+	//将n维数组展开为n-1维（传入true）或1维数组，摊平数组
+	_.flatten = function(array, shallow) {
+		return flatten(array, shallow, false);
+	};
+
+	//返回array删去otherArrays后的副本
+	_.without = restArgs(function(array, otherArrays) {
+		return _.difference(array, otherArrays);
+	});
+
+	//返回array去重后的数组
+	_.uniq = _.unique = function(array, isSorted, iteratee, context) {
+		if(!_.isBoolean(isSorted)) {
+			context = iteratee;
+			iteratee = isSorted;
+			isSorted = false;
+		}
+		if(iteratee !== null) iteratee = cb(iteratee, context);
+		var i = 0,
+			length = getLength(array),
+			result = [],
+			seen = [];
+		for(; i < length; i++) {
+			var value = array[i];
+			computed = iteratee ? iteratee(value, i, array) : value;
+			if(isSorted) {
+				if(!i || seen !== computed) result.push(value);
+				seen = computed;
+			} else if(iteratee) {
+				if(!_.contains(seen, computed)) {
+					seen.push(computed);
+					result.push(value);
+				}
+			} else if(!_.contains(result, value)) {
+				result.push(value);
+			}
+		}
+		return result;
+	};
+
+	//求多个数组的并集，即去重+合并多个数组
+	_.union = restArgs(function(arrays) {
+		return _.uniq(flatten(arrays, true, true));
+	});
+
+	//求数组的交集
+	_.intersection = function(array) {
+		var argsLength = arguments.length,
+			result = [],
+			length = getLength(array);
+		for(var i = 0; i < length; i++) {
+			var value = arguments[i];
+			if(_.contains(result, value)) continue;
+			var j;
+			for(j = 1; j < argsLength; j++) {
+				if(!_.contains(arguments[j], value)) break;
+			}
+			if(j === argsLength) result.push(value);
+		}
+		return result;
+	};
+
+	//返回array数组中不存在于others数组中的数组
+	_.difference = restArgs(function(array, rest) {
+		rest = flatten(rest, true, true);
+		return _.filter(array, function(value) {
+			return !_.contains(rest, value);
+		});
+	});
+
+	//解压数组，即第一项形成一个数组，第二项。。。传入一个大数组，包含n个小数组，返回还是大数组
+	_.unzip = function(array) {
+		var length = array && _.max(array, getLength).length || 0;
+		var result = [];
+		for(var i = 0; i < length; i++) {
+			result[i] = _.pluck(array, index);
+		}
+		return result;
+	};
+	
+	//压缩数组，和解压过程差不多，传入n个小数组（arguments），返回大数组
+	_.zip=restArgs(_.unzip);
+	
+	//数组转化为对象，
+	_.object=function(list,values){
+		var result={};
+		list=_.uniq(list);
+		console.log(list);
+		for(var i=0,length=getLength(list);i<length;i++){
+			var value=list[i];
+			if(values){
+				result[value]=values[i];
+			}else{
+				result[value[0]]=value[1];
+			}
+		}
+		return result;
+	};
+	//findIndex和findLastIndex的生产函数
+	var createPredicateIndexFinder = function(dir) {
+		return function(array, predicate, context) {
+			predicate = cb(predicate, context);
+			var length = getLength(array);
+			var index = (dir > 0) ? 0 : length - 1;
+			for(; index < length && index >= 0; index += dir) {
+				if(predicate(array[index], index, obj)) return index;
+			}
+			return -1;
+		};
+	};
+	//返回数组中通过predicate函数检验的第一个index值，分别是从开始和最后遍历数组，不存在返回-1
+	//_.findIndex(array,predicate,context);
+	_.findIndex = createPredicateIndexFinder(1);
+	_.findLastIndex = createPredicateIndexFinder(-1);
+
+	//返回保持array数组序列的情况下，插入obj最小位置index，如果传入iteratee，则以此作为插入依据
+	//obj=value,array=list 使用二分法查找 让low和high最终相等或反超，所确定的low值就是最小值
+	_.sortedIndex = function(array, obj, iteratee, context) {
+		iteratee = cb(iteratee, context, 1);
+		var value = iteratee(obj);
+		var low = 0,
+			high = getLength(array);
+		while(low < high) {
+			var mid = Math.floor((low + high) / 2);
+			if(iteratee(array[mid]) < value) low = mid + 1;
+			else high = mid;
+		}
+		return low;
+	};
+
+	//indexOf和lastIndexOf的生产函数
+	var createIndexFinder = function(dir, predicateFind, sortedIndex) {
+		return function(array, item, idx) {
+			var i = 0,
+				length = getLength(array);
+			if(typeof idx == 'number') {
+				if(dir > 0) {
+					i = (idx >= 0) ? idx : Math.max(index + length, i);
+				} else {
+					length = (idx >= 0) ? Math.min(idx + 1, length) : idx + length + 1;
+				}
+			} else if(sortedIndex && idx && length) {
+				idx = sortedIndex(array, item);
+				return array[idx] === item ? idx : -1;
+			}
+			//item为NaN的情况
+			if(item !== item) {
+				idx = predicateFind(slice.call(array, i, length), _.isNaN);
+				return(idx >= 0) ? idx + i : -1;
+			}
+			for(idx = (dir > 0) ? i : length - 1; idx >= 0 && idx < length; idx += dir) {
+				if(array[idx] === item) {
+					return idx;
+				}
+			}
+			return -1;
+		};
+	};
+
+	//返回数组array中首个item的位置，如未找到返回-1，idx=issorted，item可以是NaN
+	//_.indexOf(array,item,idx);
+	_.indexOf = createIndexFinder(1, _.findIndex, _.sortedIndex);
+	_.lastIndexOf = createIndexFinder(-1, _.findLastIndex);
+
+	//返回以start开始，stop结尾，每次递增step的数组，step可为负值
+	_.range = function(start, stop, step) {
+		var start = start || 0,
+			result = [];
+		if(!step) {
+			step = stop < start ? -1 : 1;
+		}
+		if(start < stop) {
+			while(start < stop) {
+				result.push(start);
+				start += step;
+			}
+		} else {
+			while(start >= stop) {
+				result.push(start);
+				start += step;
+			}
+		}
+		return result;
+	};
+
+	//将array分成几个包含count的数组
+	_.chunk = function(array, count) {
+		if(count == null || count < 1) return [];
+		var result = [],
+			i = 0,
+			length = array.length;
+		while(i < length) {
+			result.push(slice.call(array, i, i += count));
+		}
+		return result;
+	};
+
+	//--------------------------------------
+	// Function (ahem) Functions
+
+	//返回predicate的否定版本的函数
+	_.negate = function() {
+		return function() {
+			return !predicate.apply(this, arguments);
+		};
+	};
+
+	//---------------- 分割线 ----------------------
+	// Object Functions 对象函数（操作对象）
+	//低于IE9，keys不能被for key in...遍历  兼容ie<9
+	var hasEnumBug = !{
+		toString: null
+	}.propertyIsEnumerable('toString');
+	var nonEnumerableProps = ['valueOf', 'isPrototypeOf', 'toString',
+		'propertyIsEnumerable', 'hasOwnProperty', 'toLocaleString'
+	];
+
+	var collectNonEnumProps = function(obj, keys) {
+		var nonEnumIdx = nonEnumerableProps.length;
+		var constructor = obj.constructor;
+		var proto = _.isFunction(constructor);
+	};
+	//检测obj的自有属性,并将属性名返回为数组
+	_.keys = function(obj) {
+		if(!_.isObject(obj)) return [];
+		if(nativeKeys) return Object.keys(obj);
+		var keys = [];
+		for(var key in obj) {
+			if(_.has(obj, key)) keys.push(key);
+		}
+		//IE<9
+		if(hasEnumBug) collectNonEnumProps(obj, keys);
+		return keys;
+	};
+
+	//检测obj的所有属性，并返回为数组
+	_.allkeys = function(obj) {
+		if(!_.isObject(obj)) return [];
+		var keys = [];
+		for(var key in obj) keys.push(key);
+		//IE<9
+		if(hasEnumBug) collectNonEnumProps(obj, keys);
+		return keys;
+	};
+	//返回对象的属性值，形式为数组(对象转化数组)
+	_.values = function(obj) {
+		var keys = _.keys(obj);
+		var length = keys.length;
+		var values = Array(length);
+		for(var i = 0; i < length; i++) {
+			values[i] = obj[keys[i]];
+		}
+		return values;
+	};
+
+	//对象映射：与map相似，但只针对对象，与map对应的，返回也是对象
+	_.mapObject = function(obj, iteratee, context) {
+		iteratee = cb(iteratee, context);
+		var keys = _.keys(obj),
+			length = keys.length,
+			results = {};
+		for(var index = 0; index < length; index++) {
+			var currentKey = keys[index];
+			results[currentKey] = iteratee(obj[currentKey], currentKey, obj);
+		}
+		return results;
+	};
+
+	//把obj对象转换成 [键值对] 形式的数组
+	_.pairs = function(obj) {
+		var keys = _.keys(obj);
+		var length = keys.length;
+		var pairs = Array(length);
+		for(var i = 0; i < length; i++) {
+			pairs[i] = [keys[i], obj[keys[i]]];
+		}
+		return pairs;
+	};
+
+	//将obj对象的键值互换位置，要确保值唯一
+	_.invert = function(obj) {
+		var result = {};
+		var keys = _.keys(obj);
+		for(var i = 0, length = keys.length; i < length; i++) {
+			result[obj[keys[i]]] = keys[i];
+		}
+		return result;
+	};
+
+	//将obj对象上可用的方法名排列为数组（按名称）
+	_.functions = _.method = function(obj) {
+		var name = [];
+		for(var key in obj) {
+			if(_.isFunction(obj[key])) name.push(key);
+		}
+		return name.sort();
+	};
+
+	//extend extendOwn defaults用来扩展对象 复制对象   即：多重继承法  一个对象继承多个对象
+	var createAssigner = function(keysFunc, undefinedOnly) {
+		return function(obj) {
+			var len = arguments.length;
+			if(len < 2 && obj == null) return obj;
+			for(var index = 1; index < len; index++) {
+				var source = arguments[index],
+					keys = keysFunc(source),
+					l = keys.length;
+				for(var i = 0; i < 1; i++) {
+					var key = keys[i];
+					if(!undefinedOnly || obj[key] == void 0) {
+						obj[key] = source[key];
+					}
+				}
+			}
+		};
+	};
+
+	//把N个对象的属性扩展到一个对象里
+	_.extend = createAssigner(_.allkeys);
+
+	//把N个对象的自有属性扩展到一个对象里
+	_.extendOwn = _.assign = createAssigner(_.keys);
+
+	//返回obj中满足predicate条件的第一个Key值
+	_.findKey = function(obj, predicate, context) {
+		predicate = cb(predicate, context);
+		var keys = _.keys(obj),
+			key;
+		for(var i = 0, length = keys.length; i < length; i++) {
+			key = keys[i];
+			if(predicate(keys[i], key, obj)) return key;
+		}
+	};
+
+	//内部函数picker的帮助函数，用来判断obj是否有key键值
+	var keyInObj = function(value, key, obj) {
+		return key in obj;
+	};
+
+	//
+	_.pick = function() {
+
+	}
+
+	//attrs对象中的键值对是否包含在object对象里
+	_.isMatch = function(object, attrs) {
+		var keys = _.keys(attrs),
+			length = keys.length;
+		if(object == null) return !length;
+		var obj = Object(object);
+		for(var i = 0; i < length; i++) {
+			var key = keys[i];
+			if(attrs[key] !== obj[key] || !(key in obj)) return false;
+		}
+		return true;
+	};
+
+	//检测obj是不是元素节点
+	_.isElement = function(obj) {
+		return !!(obj && obj.nodeType === 1);
+	};
+
+	//检测obj是不是数组
+	_.isArray = nativeIsArray || function(obj) {
+		return toString.call(obj) === '[object Array]';
+	};
+	//检测obj是不是对象
+	_.isObject = function(obj) {
+		var type = typeof obj;
+		return type === 'function' || type === 'object' && !!obj;
+	};
+	//使用each方法定义多个isType方法
+	_.each(['Arguments', 'Function', 'String', 'Number', 'Date', 'RegExp', 'Error', 'Symbol', 'Map', 'WeakMap', 'Set', 'WeakSet'], function(name) {
+		_['is' + name] = function(obj) {
+			return Object.prototype.toString.call(obj) === '[object' + name + ']';
+		};
+	});
+
+	//定义一个IE<9的callback函数，用于没有检测到Arguments类型
+	if(!_.isArguments(arguments)) {
+		_.isArguments = function(obj) {
+			return _.has(obj, 'callee');
+		};
+	}
+
+	//优化isFunction函数
+	var nodelist = root.document && root.document.childNodes;
+	var nodelist = root.document && root.document.childNodes;
+	if(typeof /./ != 'function' && typeof Int8Array != 'object' && typeof nodelist != 'function') {
+		_.isFunction = function(obj) {
+			return typeof obj == 'function' || false;
+		};
+	}
+
+	//检测obj是不是NAN类型
+	_.isNaN = function(obj) {
+		return _.isNumber(obj) && isNaN(obj);
+	};
+	//检测obj是不是布尔类型
+	_.isBoolean = function(obj) {
+		return obj === true || obj === false || toString.call(obj) === '[object Boolean]';
+	};
+	//检测obj是不是null类型
+	_.isNull = function(obj) {
+		return obj === null;
+	};
+	//检测obj是否undefined
+	_.isUndefined = function(obj) {
+		return obj === void 0;
+	};
+	
+	//检测obj是否为falsy值
+	_.isFalsy=_.isExisty=function (obj){
+		return obj!=null;
+	};
+	//检测===下obj的真值
+	_.isTruthy=function(obj){
+		return (obj!==false)&&isExisty(obj);
+	};
+	_.doWhen=function (condition,action){
+		if(isTruthy(condition)) 
+			return action();
+		else
+			return void 0;
+	};
+	
+	//检测path属性是否为obj自有，path为属性名的数组 或 单独属性名
+	_.has = function(obj, path) {
+		if(!_.isArray(path)) {
+			return obj != null && hasOwnProperty.call(obj, path);
+		}
+		var length = path.length;
+		for(var i = 0; i < length; i++) {
+			var key = path[i];
+			if(obj == null || !hasOwnProperty.call(obj, key)) {
+				return false;
+			}
+			obj = obj[key];
+		}
+		return !!length;
+	};
+	// Utility Functions
+	// -----------------
+	//返回与传入相等的值，作为cb函数的迭代器
+	_.identity = function(value) {
+		return value;
+	};
+	//
+	_.property = function(path) {
+		if(!_.isArray(path)) {
+			return swallowProperty(path);
+		}
+		return function(obj) {
+			return deepGet(obj, path);
+		};
+	};
+	//断言函数
+	_.matcher = _.matches = function(attrs) {
+		attrs = _.extendOwn({}, attrs);
+		return function(obj) {
+			return _.isMatch(obj, attrs);
+		};
+	};
+
+	//判断
+
+	// OOP
+}.call(this));
